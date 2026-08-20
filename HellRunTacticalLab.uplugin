@@ -1,0 +1,33 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Tactical AI Lab",
+  "Description": "Native Unreal tactical AI scenario editor, deterministic simulator, map baker, GOAP debugger, and lifetime analysis toolkit.",
+  "Category": "AI",
+  "CreatedBy": "Hell Run",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "Plugins": [
+    {
+      "Name": "HellRunTraversalNavigation",
+      "Enabled": true
+    },
+    {
+      "Name": "HellRunGOAP",
+      "Enabled": true
+    }
+  ],
+  "Modules": [
+    {
+      "Name": "HellRunTacticalLab",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "HellRunTacticalLabEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
