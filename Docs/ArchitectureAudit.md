@@ -12,7 +12,7 @@ This audit follows `tactical_ai_goap_simulation_debugger_handoff.md`. The lab is
 | Perception | Gameplay perception/controller configuration | Canvas previously drew one global cone clipped by baked 2D obstacle edges | Not authoritative. This milestone separates configured FOV and resolved 2D visibility and exposes per-profile settings; gameplay trace bridging remains required |
 | Cover | Gameplay EQS plus custom voxel generator/test | Native tactical EQS query and `TacticalLabEQSTest_VoxelPath`; simulation scores baked candidates | Query path is real voxel navigation; scoring/runtime selection still needs unified provenance |
 | Squads | Gameplay squad coordination and movement grants | Fixture fields (`SquadId`, `SquadRole`, `bMovementGranted`) | Fixture approximation, explicitly labeled in decision provenance |
-| Director | `UHellRunAIDirectorSubsystem` | No authoritative bridge yet | Missing by design from milestone one |
+| Director | `UHellRunAIDirectorSubsystem::GetDirectorSnapshot()` | Typed `FTacticalLabIntegrations::CaptureDirectorDebug` host adapter copied into each recorded PIE frame | Authoritative bounded aggregate snapshot; controller-only draw primitives are not yet normalized |
 | Timeline | `FHellRunTacticalLabLifetime` events/decisions/candidates | Toolkit timeline and goal graph | Real simulation history, but selection/scrubbing is not synchronized yet |
 
 ## Root cause: inconsistent FOV
@@ -94,6 +94,16 @@ The unsafe fallback is no longer treated as navigable. It is retained only as an
 - Selecting a PIE pawn drives a live inspector with active goal/action/status,
   remaining plan, replan reason, goal utility, typed facts/provenance, navigation
   path point count, and named perception blockers.
+- Live routes render independently of perception configuration. The recorder copies
+  the active `UPathFollowingComponent` path, so bots without a sight sense no longer
+  lose an otherwise valid recorded route at the presentation layer.
+- Ranged enemies additionally publish their last accepted tactical route through
+  the host-neutral agent debug adapter. This preserves hybrid/voxel route points,
+  provider, admission reason, and exposure after PathFollowing releases its path.
+- Each frame also carries a host-neutral projection of the authoritative Director
+  snapshot: pacing phase/intensity, cadence, population, enemy states, targeting,
+  attack gates, recycling pressure, and planner-batch metrics. Historical frames
+  therefore display historical Director aggregates rather than querying live state.
 - The baked 2D obstacle fixture no longer produces a resolved ray fan. Outside
   PIE it renders configured FOV only; in PIE resolved rays are `ECC_Visibility`
   world traces from the pawn eye transform.
@@ -113,5 +123,62 @@ The unsafe fallback is no longer treated as navigable. It is retained only as an
   but it is not a replacement for AI Perception's observed-target history.
 - Add a scrubber tied to recorded PIE time and route/GOAP transitions; the current
   controls step snapshots one frame at a time.
-- Add explicit squad/director adapters and event streams. The current player-group
-  centroid is only a camera-follow target, not fabricated squad reasoning.
+- Add explicit squad and Director transition-event streams. Director aggregate
+  snapshots are bridged, but its draw-only per-agent steering/EQS primitives are
+  not yet a durable event contract. The player-group centroid remains only a
+  camera-follow target, not fabricated squad reasoning.
+
+## Authoritative GOAP runtime event contract (2026-08-30)
+
+### Implemented in production GOAP
+
+- `HellRunGOAP` now defines a typed `FGOAPRuntimeEvent` contract and a native,
+  synchronous per-brain event delegate. Events carry a process-monotonic sequence,
+  world time, component-lifetime agent GUID, readable identity, domain, typed
+  goal/action/plan/fact fields, reasons, provenance, expiry, and state revisions.
+- Brain transitions emit logic, replan-request, plan-queue, plan success/failure,
+  goal-selection, action lifecycle, and agent-fact lifecycle events at their
+  authoritative transition points. Immediate tasks emit one start and one terminal
+  event; timeout is distinct from failure and abort.
+- Shared world/squad fact set, clear, and expiry transitions flow through the
+  world-state subsystem to each affected brain with typed old/new records. Weak
+  brain registration and the native event source do not retain destroyed actors.
+- Failed planning results remain in the debug snapshot and are broadcast through
+  the legacy plan delegate as well as the runtime stream. The original replan
+  request reason is no longer replaced by a later planner failure, and aggregate
+  failed-search metrics are preserved.
+
+### Live recorder and preview integration
+
+- The editor module now owns a persistent PIE session recorder. It subscribes to
+  the process-wide native GOAP stream before a PIE world exists, samples spatial
+  frames at 5 Hz, discovers later-spawned brains, bounds frame/event history, and
+  retains the completed session after PIE ends. Opening or closing a Lab window
+  no longer controls instrumentation.
+- Spatial frames sample at a bounded 10 Hz. Surface updates may check at 20 Hz,
+  while the expensive inspector remains capped at 5 Hz and the event timeline is
+  reconstructed only when the event count changes. This separates visual cadence
+  from event-list cost without polling gameplay at render frequency.
+- Enabling Attach PIE invokes the existing editor-world bake/minimap pipeline once
+  before consuming the live session. Baking remains a toolkit operation rather
+  than work performed by the persistent recorder tick.
+- `FTacticalLabEditorToolkit` is now a read-only session consumer. The tactical
+  surface defaults to the live recording, agent selection uses the session GUID,
+  the inspector reads the displayed historical frame, and the GOAP timeline reads
+  authoritative transition events rather than comparing snapshots.
+- Selecting a recorded event selects its agent and displays the nearest spatial
+  frame at or before the event time. Manual frame stepping remains stable when old
+  bounded frames are evicted, and Return to Live resumes newest-frame following.
+
+### Explicitly incomplete and unverified
+
+- Resolved diagnostic sight rays are no longer generated by the recorder; the
+  preview shows configured sight while authoritative AI Perception stimuli remain
+  a future source adapter.
+- The existing goal graph consumes offline lifetime data and is not yet backed by
+  a historical live-session graph model.
+- Director aggregate state is recorded, but per-agent steering vectors, EQS
+  candidates, squad links, and maneuver debug geometry still exist only in the
+  gameplay debug-draw path and are not presented as authoritative Lab data.
+- These source changes have not been compiled, run through automation, or observed
+  in PIE in this workspace as part of this milestone.

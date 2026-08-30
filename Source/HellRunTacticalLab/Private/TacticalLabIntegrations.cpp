@@ -4,6 +4,8 @@ namespace
 {
 FTacticalLabIntegrations::FPlanHandler GPlanHandler;
 FTacticalLabIntegrations::FActionProducesFactHandler GActionProducesFactHandler;
+FTacticalLabIntegrations::FDirectorDebugHandler GDirectorDebugHandler;
+FTacticalLabIntegrations::FAgentRuntimeDebugHandler GAgentRuntimeDebugHandler;
 }
 
 void FTacticalLabIntegrations::SetPlanHandler(FPlanHandler InHandler)
@@ -17,6 +19,18 @@ void FTacticalLabIntegrations::SetActionProducesFactHandler(
     GActionProducesFactHandler = MoveTemp(InHandler);
 }
 
+void FTacticalLabIntegrations::SetDirectorDebugHandler(
+    FDirectorDebugHandler InHandler)
+{
+    GDirectorDebugHandler = MoveTemp(InHandler);
+}
+
+void FTacticalLabIntegrations::SetAgentRuntimeDebugHandler(
+    FAgentRuntimeDebugHandler InHandler)
+{
+    GAgentRuntimeDebugHandler=MoveTemp(InHandler);
+}
+
 bool FTacticalLabIntegrations::BuildPlan(const FTacticalLabPlanRequest& Request,
     FTacticalLabPlanResult& OutResult)
 {
@@ -28,4 +42,18 @@ bool FTacticalLabIntegrations::ActionProducesFact(const FSoftObjectPath& Domain,
 {
     return GActionProducesFactHandler &&
         GActionProducesFactHandler(Domain, Action, Fact);
+}
+
+bool FTacticalLabIntegrations::CaptureDirectorDebug(UWorld& World,
+    FTacticalLabDirectorDebugSnapshot& OutSnapshot)
+{
+    OutSnapshot={};
+    return GDirectorDebugHandler&&GDirectorDebugHandler(World,OutSnapshot);
+}
+
+bool FTacticalLabIntegrations::CaptureAgentRuntimeDebug(const APawn& Pawn,
+    FTacticalLabAgentRuntimeDebugSnapshot& OutSnapshot)
+{
+    OutSnapshot={};
+    return GAgentRuntimeDebugHandler&&GAgentRuntimeDebugHandler(Pawn,OutSnapshot);
 }

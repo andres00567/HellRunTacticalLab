@@ -44,6 +44,9 @@ public:
     void SelectEntity(int32 EntityIndex);
     void SetPIEFrame(const FTacticalLabPIEFrame* Frame);
     void CenterOnWorld(FVector2D WorldPosition);
+    /** Shift only enough to keep the live player bounds inside a viewport dead zone. */
+    void EnsurePIEPlayersVisible(const FTacticalLabPIEFrame& Frame,
+        float EdgePadding=96.0f);
     void SetEQSResults(TArray<FTacticalLabEQSItem> InItems,
         FString InQueryStatus,TOptional<FVector2D> InQueryOrigin=TOptional<FVector2D>());
     void SetEQSPaths(TArray<TArray<FVector2D>> InPaths);

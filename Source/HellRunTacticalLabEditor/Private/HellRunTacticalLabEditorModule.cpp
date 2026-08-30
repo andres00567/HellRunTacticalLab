@@ -1,14 +1,22 @@
 #include "IHellRunTacticalLabEditorModule.h"
 #include "TacticalLabEditorToolkit.h"
 #include "TacticalLabScenarioAsset.h"
+#include "TacticalLabPIESessionRecorder.h"
+#include "TacticalLabToolset.h"
 #include "HAL/IConsoleManager.h"
 #include "Modules/ModuleManager.h"
+#include "Misc/CoreDelegates.h"
+#include "ToolsetRegistry/UToolsetRegistry.h"
 
 class FHellRunTacticalLabEditorModule final : public IHellRunTacticalLabEditorModule
 {
 public:
     virtual void StartupModule() override
     {
+        PIESessionRecorder=MakeUnique<FTacticalLabPIESessionRecorder>();
+        PIESessionRecorder->Initialize();
+        if (UToolsetRegistry::IsAvailable()) RegisterToolset();
+        else PostEngineInitHandle = FCoreDelegates::GetOnPostEngineInit().AddRaw(this, &FHellRunTacticalLabEditorModule::RegisterToolset);
         DiagnosticBakeCommand=IConsoleManager::Get().RegisterConsoleCommand(
             TEXT("HellRun.TacticalLab.BakeDiagnostic"),
             TEXT("Opens the real Tactical Lab editor and invokes its Bake Map action."),
@@ -24,6 +32,13 @@ public:
 
     virtual void ShutdownModule() override
     {
+        if(PIESessionRecorder)
+        {
+            PIESessionRecorder->Shutdown();
+            PIESessionRecorder.Reset();
+        }
+        if (PostEngineInitHandle.IsValid()) FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitHandle);
+        if (UToolsetRegistry::IsAvailable()) UToolsetRegistry::UnregisterToolsetClass(UTacticalLabToolset::StaticClass());
         if(DiagnosticBakeCommand)
         {
             IConsoleManager::Get().UnregisterConsoleObject(DiagnosticBakeCommand);
@@ -62,6 +77,12 @@ public:
     }
 
 private:
+    void RegisterToolset()
+    {
+        if (UToolsetRegistry::IsAvailable() && !UToolsetRegistry::IsToolsetClassRegistered(UTacticalLabToolset::StaticClass()))
+            UToolsetRegistry::RegisterToolsetClass(UTacticalLabToolset::StaticClass());
+    }
+
     void OpenLabAndBakeDiagnostic()
     {
         UTacticalLabScenarioAsset* Asset=NewObject<UTacticalLabScenarioAsset>(
@@ -86,6 +107,8 @@ private:
     }
 
     FBakeWorldHandler BakeWorldHandler;
+    TUniquePtr<FTacticalLabPIESessionRecorder> PIESessionRecorder;
+    FDelegateHandle PostEngineInitHandle;
     IConsoleObject* DiagnosticBakeCommand=nullptr;
     IConsoleObject* DiagnosticPlaygroundCommand=nullptr;
 };

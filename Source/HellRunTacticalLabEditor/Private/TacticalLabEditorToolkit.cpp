@@ -8,6 +8,7 @@
 #include "TacticalLabEQSTest_VoxelPath.h"
 #include "TacticalLabEQSTest_CoverLOS.h"
 #include "TacticalLabScenarioAsset.h"
+#include "TacticalLabPIESessionRecorder.h"
 #include "TacticalLabEQSContext.h"
 #include "DataProviders/AIDataProvider_QueryParams.h"
 #include "Editor.h"
@@ -117,6 +118,20 @@ void FTacticalLabEditorToolkit::Initialize(UTacticalLabScenarioAsset* InAsset,
     RegenerateMenusAndToolbars();
     Status=TEXT("Ready — use Bake Map or load a scenario fixture");
     ResetSimulation();
+    if(TacticalSurface&&!bPIETickerActive)
+    {
+        bPIETickerActive=true;
+        TWeakPtr<FTacticalLabEditorToolkit> WeakThis=SharedThis(this);
+        TacticalSurface->RegisterActiveTimer(0.0f,
+            FWidgetActiveTimerDelegate::CreateLambda(
+                [WeakThis](double Now,float Delta)
+                {
+                    const TSharedPtr<FTacticalLabEditorToolkit> Self=
+                        WeakThis.Pin();
+                    return Self?Self->TickPIEFeed(Now,Delta)
+                        :EActiveTimerReturnType::Stop;
+                }));
+    }
 }
 
 void FTacticalLabEditorToolkit::RunBakeDiagnostic()
@@ -449,14 +464,23 @@ void FTacticalLabEditorToolkit::HandleEntitySelected(const int32 EntityIndex)
     if(const FTacticalLabPIEFrame* Frame=GetDisplayedPIEFrame())
     {
         SelectedEntityIndex=INDEX_NONE;
-        SelectedPIEAgentId=Frame->Agents.IsValidIndex(EntityIndex)
-            ?Frame->Agents[EntityIndex].Entity.Id:NAME_None;
+        if(Frame->Agents.IsValidIndex(EntityIndex))
+        {
+            SelectedPIEAgentGuid=Frame->Agents[EntityIndex].AgentId;
+            SelectedPIEAgentId=Frame->Agents[EntityIndex].Entity.Id;
+        }
+        else
+        {
+            SelectedPIEAgentGuid.Invalidate();
+            SelectedPIEAgentId=NAME_None;
+        }
         RefreshAgentInspector();
         RefreshSimulationViews();
         if(!SelectedPIEAgentId.IsNone()&&GetTabManager().IsValid())
             GetTabManager()->TryInvokeTab(InspectorTabId);
         return;
     }
+    SelectedPIEAgentGuid.Invalidate();
     SelectedPIEAgentId=NAME_None;
     SelectedEntityIndex=EntityIndex;
     if(TacticalSurface&&EntityIndex!=INDEX_NONE)TacticalSurface->SelectEntity(EntityIndex);
@@ -519,7 +543,9 @@ void FTacticalLabEditorToolkit::RunFindCoverForSelected()
     {
         const FTacticalLabPIEAgentSnapshot* Agent=Frame->Agents.FindByPredicate(
             [this](const FTacticalLabPIEAgentSnapshot& Candidate)
-            {return Candidate.Entity.Id==SelectedPIEAgentId;});
+            {return SelectedPIEAgentGuid.IsValid()
+                ?Candidate.AgentId==SelectedPIEAgentGuid
+                :Candidate.Entity.Id==SelectedPIEAgentId;});
         if(!Agent||Agent->Entity.Kind!=EHellRunTacticalLabEntityKind::Enemy)
         {
             Status=TEXT("Attach PIE and select a live AI pawn before running Find Cover.");
@@ -561,13 +587,19 @@ void FTacticalLabEditorToolkit::RefreshAgentInspector()
     {
         const FTacticalLabPIEAgentSnapshot* Agent=Frame->Agents.FindByPredicate(
             [this](const FTacticalLabPIEAgentSnapshot& Candidate)
-            {return Candidate.Entity.Id==SelectedPIEAgentId;});
+            {return SelectedPIEAgentGuid.IsValid()
+                ?Candidate.AgentId==SelectedPIEAgentGuid
+                :Candidate.Entity.Id==SelectedPIEAgentId;});
         if(!Agent)
         {
             Agent=Frame->Agents.FindByPredicate([](const FTacticalLabPIEAgentSnapshot& Candidate)
                 {return Candidate.bHasGOAP;});
             if(!Agent&&!Frame->Agents.IsEmpty())Agent=&Frame->Agents[0];
-            if(Agent)SelectedPIEAgentId=Agent->Entity.Id;
+            if(Agent)
+            {
+                SelectedPIEAgentGuid=Agent->AgentId;
+                SelectedPIEAgentId=Agent->Entity.Id;
+            }
         }
         if(!Agent)
         {
@@ -605,9 +637,13 @@ void FTacticalLabEditorToolkit::RefreshAgentInspector()
             .ColorAndOpacity(FLinearColor(.85f,.68f,.2f))];
         AgentInspectorBox->AddSlot().AutoHeight().Padding(6,2)
         [SNew(STextBlock).AutoWrapText(true).Text(FText::FromString(FString::Printf(
-            TEXT("Sight: %.0f cm, half-angle %.1f deg\nResolved rays: %d / %d\nPath points: %d\nBlocking hits:%s"),
+            TEXT("Sight: %.0f cm, half-angle %.1f deg\nResolved rays: %d / %d\nPath points: %d\nRoute: %s | exposure %.2f\nAdmission: %s\nBlocking hits:%s"),
             Agent->VisionRange,Agent->VisionHalfAngle,Agent->VisionRays.Num(),
-            Agent->VisionRayCount,Agent->MovementPath.Num(),Blockers.IsEmpty()?TEXT(" none"):*Blockers)))];
+            Agent->VisionRayCount,Agent->MovementPath.Num(),
+            Agent->RouteProvider.IsEmpty()?TEXT("PathFollowing"):*Agent->RouteProvider,
+            Agent->RouteExposure,
+            Agent->RouteAdmission.IsEmpty()?TEXT("active runtime path"):*Agent->RouteAdmission,
+            Blockers.IsEmpty()?TEXT(" none"):*Blockers)))];
         if(Agent->bHasGOAP)
         {
             const FGOAPBrainDebugSnapshot& Debug=Agent->GOAP;
@@ -631,9 +667,13 @@ void FTacticalLabEditorToolkit::RefreshAgentInspector()
                 .ColorAndOpacity(FLinearColor(.35f,.9f,.65f))];
             AgentInspectorBox->AddSlot().AutoHeight().Padding(6,2)
             [SNew(STextBlock).AutoWrapText(true).Text(FText::FromString(FString::Printf(
-                TEXT("Domain: %s\nGoal: %s\nAction: %s (%s)\nPlan: %s\nReplan: %s\nWorld revision: %d\n\nGOAL SCORES%s\n\nFACTS%s"),
+                TEXT("Domain: %s\nGoal: %s\nAction: %s (%s)\nPlan: %s\nLast solve: %s, cost %.2f, %d expanded / %d visited%s\nReplan: %s\nWorld revision: %d\n\nGOAL SCORES%s\n\nFACTS%s"),
                 *Debug.DomainName.ToString(),*Debug.ActiveGoal.ToString(),*Debug.ActiveAction.ToString(),
                 *UEnum::GetValueAsString(Debug.ActionStatus),Plan.IsEmpty()?TEXT("none"):*Plan,
+                Debug.LastPlan.bSucceeded?TEXT("success"):TEXT("failure"),Debug.LastPlan.Cost,
+                Debug.LastPlan.ExpandedNodes,Debug.LastPlan.VisitedStates,
+                Debug.LastPlan.FailureReason.IsEmpty()?TEXT(""):
+                    *FString::Printf(TEXT(" (%s)"),*Debug.LastPlan.FailureReason),
                 *Debug.LastReplanReason,Debug.WorldStateRevision,*Scores,*Facts)))];
         }
         else
@@ -1090,17 +1130,25 @@ void FTacticalLabEditorToolkit::FrameAll() { if (TacticalSurface) TacticalSurfac
 
 const FTacticalLabPIEFrame* FTacticalLabEditorToolkit::GetDisplayedPIEFrame() const
 {
-    if(!bPIEAttached||PIEFrames.IsEmpty())return nullptr;
-    const int32 Index=PIEFrameCursor==INDEX_NONE?PIEFrames.Num()-1:
-        FMath::Clamp(PIEFrameCursor,0,PIEFrames.Num()-1);
-    return &PIEFrames[Index];
+    const FTacticalLabPIESessionRecorder* Recorder=
+        FTacticalLabPIESessionRecorder::Get();
+    if(!bPIEAttached||!Recorder) return nullptr;
+    const TArray<FTacticalLabPIEFrame>& Frames=Recorder->GetSession().Frames;
+    if(Frames.IsEmpty()) return nullptr;
+    const int32 Index=PIEFrameCursor==INDEX_NONE?Frames.Num()-1:
+        FMath::Clamp(PIEFrameCursor,0,Frames.Num()-1);
+    return &Frames[Index];
 }
 
 void FTacticalLabEditorToolkit::TogglePIEAttachment()
 {
     bPIEAttached=!bPIEAttached;
     PIEFrameCursor=INDEX_NONE;
+    PIEReplayWorldTime=-1.0;
+    LastPIETimelineSequence=MIN_int64;
+    LastPIEInspectorRefreshSeconds=-BIG_NUMBER;
     SelectedPIEAgentId=NAME_None;
+    SelectedPIEAgentGuid.Invalidate();
     if(!bPIEAttached)
     {
         if(TacticalSurface)TacticalSurface->SetPIEFrame(nullptr);
@@ -1108,9 +1156,10 @@ void FTacticalLabEditorToolkit::TogglePIEAttachment()
         RefreshAgentInspector();
         return;
     }
+    BakeCurrentMap();
     Status=GEditor&&GEditor->PlayWorld
-        ?TEXT("Attached to PIE live feed; recording gameplay snapshots.")
-        :TEXT("PIE attachment armed. Start PIE to begin the live feed.");
+        ?TEXT("Viewing the persistent PIE debugger session.")
+        :TEXT("Viewing the most recent PIE recording; start PIE for live data.");
     if(TacticalSurface&&!bPIETickerActive)
     {
         bPIETickerActive=true;
@@ -1123,6 +1172,10 @@ void FTacticalLabEditorToolkit::TogglePIEAttachment()
             }));
     }
     RefreshSimulationViews();
+    if(bFollowPIEPlayers)
+        if(const FTacticalLabPIEFrame* Frame=GetDisplayedPIEFrame())
+            if(Frame->bHasPlayers&&TacticalSurface)
+                TacticalSurface->CenterOnWorld(Frame->PlayerGroupCenter);
 }
 
 void FTacticalLabEditorToolkit::TogglePIEFollow()
@@ -1141,115 +1194,132 @@ void FTacticalLabEditorToolkit::ReturnToLivePIE()
 {
     if(!bPIEAttached)return;
     PIEFrameCursor=INDEX_NONE;
-    if(TacticalSurface)TacticalSurface->SetPIEFrame(GetDisplayedPIEFrame());
+    PIEReplayWorldTime=-1.0;
+    if(TacticalSurface)
+    {
+        const FTacticalLabPIEFrame* Frame=GetDisplayedPIEFrame();
+        TacticalSurface->SetPIEFrame(Frame);
+        if(bFollowPIEPlayers&&Frame&&Frame->bHasPlayers)
+            TacticalSurface->CenterOnWorld(Frame->PlayerGroupCenter);
+    }
     Status=TEXT("PIE feed: LIVE");
     RefreshAgentInspector();
 }
 
 void FTacticalLabEditorToolkit::StepPIERecording(const int32 DeltaFrames)
 {
-    if(!bPIEAttached||PIEFrames.IsEmpty())return;
-    const int32 Current=PIEFrameCursor==INDEX_NONE?PIEFrames.Num()-1:PIEFrameCursor;
-    PIEFrameCursor=FMath::Clamp(Current+DeltaFrames,0,PIEFrames.Num()-1);
+    const FTacticalLabPIESessionRecorder* Recorder=
+        FTacticalLabPIESessionRecorder::Get();
+    if(!bPIEAttached||!Recorder||Recorder->GetSession().Frames.IsEmpty())return;
+    const TArray<FTacticalLabPIEFrame>& Frames=Recorder->GetSession().Frames;
+    const int32 Current=PIEFrameCursor==INDEX_NONE?Frames.Num()-1:PIEFrameCursor;
+    PIEFrameCursor=FMath::Clamp(Current+DeltaFrames,0,Frames.Num()-1);
+    PIEReplayWorldTime=Frames[PIEFrameCursor].WorldTime;
     if(TacticalSurface)TacticalSurface->SetPIEFrame(GetDisplayedPIEFrame());
     Status=FString::Printf(TEXT("PIE replay %.2fs | frame %d/%d | Live returns to gameplay"),
-        PIEFrames[PIEFrameCursor].WorldTime,PIEFrameCursor+1,PIEFrames.Num());
+        Frames[PIEFrameCursor].WorldTime,PIEFrameCursor+1,Frames.Num());
+    RefreshAgentInspector();
+    RefreshPIETimeline();
+}
+
+void FTacticalLabEditorToolkit::SelectPIEEvent(const int64 Sequence)
+{
+    const FTacticalLabPIESessionRecorder* Recorder=
+        FTacticalLabPIESessionRecorder::Get();
+    if(!Recorder) return;
+    const FTacticalLabPIESession& Session=Recorder->GetSession();
+    const FGOAPRuntimeEvent* Event=Session.Events.FindByPredicate(
+        [Sequence](const FGOAPRuntimeEvent& Candidate)
+        {return Candidate.Sequence==Sequence;});
+    if(!Event) return;
+    SelectedPIEAgentId=Event->AgentName;
+    SelectedPIEAgentGuid=Event->AgentId;
+    PIEReplayWorldTime=Event->WorldTime;
+    PIEFrameCursor=INDEX_NONE;
+    for(int32 Index=Session.Frames.Num()-1;Index>=0;--Index)
+        if(Session.Frames[Index].WorldTime<=Event->WorldTime)
+        {PIEFrameCursor=Index;break;}
+    if(PIEFrameCursor==INDEX_NONE&&!Session.Frames.IsEmpty())PIEFrameCursor=0;
+    if(TacticalSurface)
+    {
+        TacticalSurface->SetPIEFrame(GetDisplayedPIEFrame());
+        if(const FTacticalLabPIEFrame* Frame=GetDisplayedPIEFrame())
+        {
+            const int32 AgentIndex=Frame->Agents.IndexOfByPredicate(
+                [Event](const FTacticalLabPIEAgentSnapshot& Agent)
+                {return Agent.AgentId==Event->AgentId;});
+            if(AgentIndex!=INDEX_NONE) TacticalSurface->SelectEntity(AgentIndex);
+        }
+    }
+    Status=FString::Printf(TEXT("PIE event #%lld at %.2fs | %s"),
+        Sequence,Event->WorldTime,
+        *UEnum::GetValueAsString(Event->Type));
     RefreshAgentInspector();
 }
 
-bool FTacticalLabEditorToolkit::CapturePIEFrame(UWorld& World,
-    FTacticalLabPIEFrame& OutFrame) const
+void FTacticalLabEditorToolkit::RefreshPIETimeline()
 {
-    OutFrame={};
-    OutFrame.WorldTime=World.GetTimeSeconds();
-    FVector2D PlayerSum=FVector2D::ZeroVector;
-    int32 PlayerCount=0;
-    for(TActorIterator<APawn> It(&World);It;++It)
-        if(It->GetController()&&It->GetController()->IsPlayerController())
-        {PlayerSum+=FVector2D(It->GetActorLocation());++PlayerCount;}
-    if(PlayerCount>0)
+    if(!TimelineBox||!bPIEAttached) return;
+    TimelineBox->ClearChildren();
+    const FTacticalLabPIESessionRecorder* Recorder=
+        FTacticalLabPIESessionRecorder::Get();
+    const FTacticalLabPIESession* Session=Recorder?&Recorder->GetSession():nullptr;
+    TimelineBox->AddSlot().AutoHeight().Padding(10,6)
+    [SNew(STextBlock).Text(FText::FromString(SelectedPIEAgentId.IsNone()
+        ?TEXT("LIVE GOAP EVENTS | all agents")
+        :FString::Printf(TEXT("LIVE GOAP EVENTS | %s"),
+            *SelectedPIEAgentId.ToString())))
+        .Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"),10))
+        .ColorAndOpacity(FLinearColor(.35f,.85f,.72f))];
+    if(!Session||Session->Events.IsEmpty())
     {
-        OutFrame.PlayerGroupCenter=PlayerSum/PlayerCount;
-        OutFrame.bHasPlayers=true;
+        TimelineBox->AddSlot().AutoHeight().Padding(20)
+        [SNew(STextBlock).Text(LOCTEXT("NoPIEEvents",
+            "No authoritative GOAP events have been recorded in this PIE session."))];
+        return;
     }
 
-    constexpr int32 MaximumTrackedAgents=64;
-    for(TActorIterator<APawn> It(&World);It&&OutFrame.Agents.Num()<MaximumTrackedAgents;++It)
+    TArray<int32> VisibleEvents;
+    VisibleEvents.Reserve(300);
+    for(int32 Index=Session->Events.Num()-1;
+        Index>=0&&VisibleEvents.Num()<300;--Index)
     {
-        APawn* Pawn=*It;
-        AController* Controller=Pawn->GetController();
-        if(!Controller)continue;
-        AAIController* AI=Cast<AAIController>(Controller);
-        const bool bPlayer=Controller->IsPlayerController();
-        if(!AI&&!bPlayer)continue;
-
-        FTacticalLabPIEAgentSnapshot& Agent=OutFrame.Agents.AddDefaulted_GetRef();
-        Agent.Entity.Id=Pawn->GetFName();
-        Agent.Entity.Kind=bPlayer?EHellRunTacticalLabEntityKind::Player:
-            EHellRunTacticalLabEntityKind::Enemy;
-        Agent.Entity.Team=bPlayer?TEXT("Players"):TEXT("AI");
-        Agent.Entity.ArchetypeId=Pawn->GetClass()->GetFName();
-        Agent.Entity.Position=FVector2D(Pawn->GetActorLocation());
-        Agent.Entity.Velocity=FVector2D(Pawn->GetVelocity());
-        const FVector Forward=Pawn->GetActorForwardVector();
-        Agent.Entity.Facing=FVector2D(Forward).GetSafeNormal();
-        Agent.Entity.bAlive=!Pawn->IsActorBeingDestroyed();
-
-        UGOAPBrainComponent* Brain=Controller->FindComponentByClass<UGOAPBrainComponent>();
-        if(!Brain)Brain=Pawn->FindComponentByClass<UGOAPBrainComponent>();
-        if(Brain&&Brain->IsRunning())
-        {
-            Agent.bHasGOAP=true;
-            Agent.GOAP=Brain->GetDebugSnapshot();
-        }
-
-        if(AI)
-        {
-            if(const UPathFollowingComponent* Following=AI->GetPathFollowingComponent())
-                if(const FNavPathSharedPtr Path=Following->GetPath();Path.IsValid())
-                    for(const FNavPathPoint& Point:Path->GetPathPoints())
-                        Agent.MovementPath.Add(FVector2D(Point.Location));
-
-            UAIPerceptionComponent* Perception=AI->GetPerceptionComponent();
-            const UAISenseConfig_Sight* Sight=Perception
-                ?Perception->GetSenseConfig<UAISenseConfig_Sight>():nullptr;
-            if(Sight)
-            {
-                FVector Eye;FRotator EyeRotation;
-                Pawn->GetActorEyesViewPoint(Eye,EyeRotation);
-                Agent.VisionOrigin=FVector2D(Eye);
-                Agent.Entity.Facing=FVector2D(EyeRotation.Vector()).GetSafeNormal();
-                Agent.VisionRange=Sight->SightRadius;
-                Agent.VisionHalfAngle=Sight->PeripheralVisionAngleDegrees;
-                Agent.VisionRayCount=25;
-                if(SelectedPIEAgentId==Agent.Entity.Id)
-                {
-                    FCollisionQueryParams Params(SCENE_QUERY_STAT(TacticalLabPIEVision),true,Pawn);
-                    Params.AddIgnoredActor(Pawn);Params.AddIgnoredActor(Controller);
-                    for(int32 RayIndex=0;RayIndex<Agent.VisionRayCount;++RayIndex)
-                    {
-                        const float Alpha=RayIndex/static_cast<float>(Agent.VisionRayCount-1);
-                        const FRotator RayRotation(0.0f,EyeRotation.Yaw+FMath::Lerp(
-                            -Agent.VisionHalfAngle,Agent.VisionHalfAngle,Alpha),0.0f);
-                        const FVector RayEnd=Eye+RayRotation.Vector()*Agent.VisionRange;
-                        FHitResult Hit;
-                        const bool bHit=World.LineTraceSingleByChannel(Hit,Eye,RayEnd,
-                            ECC_Visibility,Params);
-                        FTacticalLabPIEVisionRay& Ray=Agent.VisionRays.AddDefaulted_GetRef();
-                        Ray.End=FVector2D(bHit?Hit.ImpactPoint:RayEnd);
-                        Ray.bBlocked=bHit;
-                        if(bHit)
-                        {
-                            Ray.BlockingActor=Hit.GetActor()?Hit.GetActor()->GetFName():NAME_None;
-                            Ray.BlockingComponent=Hit.GetComponent()?Hit.GetComponent()->GetFName():NAME_None;
-                        }
-                    }
-                }
-            }
-        }
+        const FGOAPRuntimeEvent& Event=Session->Events[Index];
+        if(SelectedPIEAgentGuid.IsValid()
+            &&Event.AgentId!=SelectedPIEAgentGuid) continue;
+        if(!SelectedPIEAgentGuid.IsValid()&&!SelectedPIEAgentId.IsNone()
+            &&Event.AgentName!=SelectedPIEAgentId) continue;
+        VisibleEvents.Add(Index);
     }
-    return !OutFrame.Agents.IsEmpty();
+    Algo::Reverse(VisibleEvents);
+    for(const int32 Index:VisibleEvents)
+    {
+        const FGOAPRuntimeEvent& Event=Session->Events[Index];
+        FString Subject;
+        if(!Event.ActionName.IsNone()) Subject=Event.ActionName.ToString();
+        else if(!Event.GoalName.IsNone()) Subject=Event.GoalName.ToString();
+        else if(!Event.FactName.IsNone()) Subject=Event.FactName.ToString();
+        const FString Detail=Subject.IsEmpty()?Event.Reason:
+            FString::Printf(TEXT("%s | %s"),*Subject,*Event.Reason);
+        const FString Row=FString::Printf(TEXT("%07.2f  %-18s  %-22s  %s"),
+            Event.WorldTime,*Event.AgentName.ToString(),
+            *UEnum::GetValueAsString(Event.Type),*Detail);
+        const bool bFailure=Event.Type==EGOAPRuntimeEventType::PlanFailed
+            ||Event.Type==EGOAPRuntimeEventType::ActionFailed
+            ||Event.Type==EGOAPRuntimeEventType::ActionAborted
+            ||Event.Type==EGOAPRuntimeEventType::ActionTimedOut;
+        TimelineBox->AddSlot().AutoHeight().Padding(6,1)
+        [SNew(SButton).ContentPadding(FMargin(6,3))
+            .ToolTipText(FText::FromString(Detail))
+            .OnClicked_Lambda([this,Sequence=Event.Sequence]
+            {SelectPIEEvent(Sequence);return FReply::Handled();})
+        [SNew(STextBlock).Text(FText::FromString(Row))
+            .ColorAndOpacity(bFailure?FLinearColor(1.0f,.35f,.2f):
+                FLinearColor(.78f,.86f,.9f))
+            .Clipping(EWidgetClipping::ClipToBoundsAlways)]];
+    }
 }
+
 
 EActiveTimerReturnType FTacticalLabEditorToolkit::TickPIEFeed(double CurrentTime,float)
 {
@@ -1258,33 +1328,54 @@ EActiveTimerReturnType FTacticalLabEditorToolkit::TickPIEFeed(double CurrentTime
         bPIETickerActive=false;
         return EActiveTimerReturnType::Stop;
     }
-    UWorld* PIEWorld=GEditor?GEditor->PlayWorld:nullptr;
-    if(PIEWorld&&CurrentTime-LastPIECaptureSeconds>=.2)
+    if(CurrentTime-LastPIEUIRefreshSeconds<0.05)
+        return EActiveTimerReturnType::Continue;
+    LastPIEUIRefreshSeconds=CurrentTime;
+    const FTacticalLabPIESessionRecorder* Recorder=
+        FTacticalLabPIESessionRecorder::Get();
+    if(!Recorder) return EActiveTimerReturnType::Continue;
+    const FTacticalLabPIESession& Session=Recorder->GetSession();
+    const bool bNewFollowSession=Session.SessionId.IsValid()&&
+        Session.SessionId!=LastPIEFollowSessionId;
+    if(bNewFollowSession) LastPIEFollowSessionId=Session.SessionId;
+    if(LastPIERecorderRevision!=Session.Revision)
     {
-        LastPIECaptureSeconds=CurrentTime;
-        FTacticalLabPIEFrame Frame;
-        if(CapturePIEFrame(*PIEWorld,Frame))
+        LastPIERecorderRevision=Session.Revision;
+        if(PIEFrameCursor!=INDEX_NONE)
         {
-            if(!PIEFrames.IsEmpty()&&Frame.WorldTime+0.01f<PIEFrames.Last().WorldTime)
-            {
-                PIEFrames.Reset();
-                PIEFrameCursor=INDEX_NONE;
-            }
-            PIEFrames.Add(MoveTemp(Frame));
-            constexpr int32 MaximumFrames=900;
-            if(PIEFrames.Num()>MaximumFrames)
-            {
-                const int32 Removed=PIEFrames.Num()-MaximumFrames;
-                PIEFrames.RemoveAt(0,Removed,EAllowShrinking::No);
-                if(PIEFrameCursor!=INDEX_NONE)PIEFrameCursor=FMath::Max(0,PIEFrameCursor-Removed);
-            }
-            if(PIEFrameCursor==INDEX_NONE&&TacticalSurface)
-            {
-                TacticalSurface->SetPIEFrame(&PIEFrames.Last());
-                if(bFollowPIEPlayers&&PIEFrames.Last().bHasPlayers)
-                    TacticalSurface->CenterOnWorld(PIEFrames.Last().PlayerGroupCenter);
-            }
+            PIEFrameCursor=INDEX_NONE;
+            for(int32 Index=Session.Frames.Num()-1;Index>=0;--Index)
+                if(Session.Frames[Index].WorldTime<=PIEReplayWorldTime)
+                {PIEFrameCursor=Index;break;}
+            if(PIEFrameCursor==INDEX_NONE&&!Session.Frames.IsEmpty())
+                PIEFrameCursor=0;
+        }
+        if(TacticalSurface) TacticalSurface->SetPIEFrame(GetDisplayedPIEFrame());
+        if(PIEFrameCursor==INDEX_NONE&&bFollowPIEPlayers&&TacticalSurface
+            &&!Session.Frames.IsEmpty()&&Session.Frames.Last().bHasPlayers)
+        {
+            if(bNewFollowSession)
+                TacticalSurface->CenterOnWorld(Session.Frames.Last().PlayerGroupCenter);
+            else
+                TacticalSurface->EnsurePIEPlayersVisible(Session.Frames.Last());
+        }
+        Status=Session.bActive
+            ?FString::Printf(TEXT("PIE LIVE | %d agents | %d events | %.2fs"),
+                Session.Agents.Num(),Session.Events.Num(),
+                Session.Frames.IsEmpty()?0.0f:Session.Frames.Last().WorldTime)
+            :FString::Printf(TEXT("PIE RECORDING | %d agents | %d events"),
+                Session.Agents.Num(),Session.Events.Num());
+        if(CurrentTime-LastPIEInspectorRefreshSeconds>=0.2)
+        {
+            LastPIEInspectorRefreshSeconds=CurrentTime;
             RefreshAgentInspector();
+        }
+        const int64 LatestEventSequence=Session.Events.IsEmpty()
+            ?0:Session.Events.Last().Sequence;
+        if(LastPIETimelineSequence!=LatestEventSequence)
+        {
+            LastPIETimelineSequence=LatestEventSequence;
+            RefreshPIETimeline();
         }
     }
     return EActiveTimerReturnType::Continue;
@@ -1861,6 +1952,18 @@ void FTacticalLabEditorToolkit::ActivateSection(FName Section)
 
 void FTacticalLabEditorToolkit::RefreshSimulationViews()
 {
+    if(bPIEAttached)
+    {
+        if(TacticalSurface)
+        {
+            TacticalSurface->SetRuntimeRoutes(nullptr);
+            TacticalSurface->SetRuntimeEntities(nullptr);
+            TacticalSurface->SetPIEFrame(GetDisplayedPIEFrame());
+        }
+        if(AgentInspectorBox) RefreshAgentInspector();
+        RefreshPIETimeline();
+        return;
+    }
     const FHellRunTacticalLabLifetime* Current=Simulation?&Simulation->GetLifetime():nullptr;
     // Initialize emits LifetimeStarted immediately. Treating that bookkeeping
     // event as simulation output hid the completed lifetime after Run/Run 100,

@@ -81,8 +81,9 @@ private:
     void TogglePIEFollow();
     void ReturnToLivePIE();
     void StepPIERecording(int32 DeltaFrames);
+    void SelectPIEEvent(int64 Sequence);
+    void RefreshPIETimeline();
     EActiveTimerReturnType TickPIEFeed(double CurrentTime,float DeltaTime);
-    bool CapturePIEFrame(UWorld& World,FTacticalLabPIEFrame& OutFrame) const;
     const FTacticalLabPIEFrame* GetDisplayedPIEFrame() const;
     FText GetStatusText() const;
 
@@ -125,11 +126,16 @@ private:
     bool bPendingManualEQS = false;
     double EQSQueryStartedSeconds = 0.0;
     float ActiveCoverTraceHeight = 60.0f;
-    bool bPIEAttached = false;
+    bool bPIEAttached = true;
     bool bPIETickerActive = false;
     bool bFollowPIEPlayers = true;
-    double LastPIECaptureSeconds = 0.0;
+    FGuid LastPIEFollowSessionId;
+    uint64 LastPIERecorderRevision = 0;
+    int64 LastPIETimelineSequence = MIN_int64;
+    double LastPIEUIRefreshSeconds = -BIG_NUMBER;
+    double LastPIEInspectorRefreshSeconds = -BIG_NUMBER;
     int32 PIEFrameCursor = INDEX_NONE;
+    double PIEReplayWorldTime = -1.0;
+    FGuid SelectedPIEAgentGuid;
     FName SelectedPIEAgentId;
-    TArray<FTacticalLabPIEFrame> PIEFrames;
 };

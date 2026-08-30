@@ -10,7 +10,8 @@ public class HellRunTacticalLabEditor : ModuleRules
             "Core", "CoreUObject", "Engine", "HellRunTacticalLab", "HellRunTraversalNavigation", "HellRunGOAP",
             "UnrealEd", "EditorFramework", "AssetDefinition", "AssetTools",
             "GraphEditor", "PropertyEditor", "Slate", "SlateCore", "ToolMenus",
-            "ApplicationCore", "InputCore", "Json", "JsonUtilities", "ImageCore", "AIModule", "NavigationSystem"
+            "ApplicationCore", "InputCore", "Json", "JsonUtilities", "ImageCore", "AIModule", "NavigationSystem",
+            "AssetRegistry", "ToolsetRegistry"
         });
     }
 }

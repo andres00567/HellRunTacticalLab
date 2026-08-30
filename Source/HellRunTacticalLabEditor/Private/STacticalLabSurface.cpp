@@ -83,7 +83,11 @@ void STacticalLabSurface::SetEQSPaths(TArray<TArray<FVector2D>> InPaths)
 
 void STacticalLabSurface::SelectEntity(const int32 EntityIndex)
 {
-    if(!Asset.IsValid()||!Asset->Scenario.Entities.IsValidIndex(EntityIndex))return;
+    const bool bValidPIEEntity=PIEFrame.IsSet()
+        &&PIEFrame->Agents.IsValidIndex(EntityIndex);
+    const bool bValidScenarioEntity=Asset.IsValid()
+        &&Asset->Scenario.Entities.IsValidIndex(EntityIndex);
+    if(!bValidPIEEntity&&!bValidScenarioEntity)return;
     Selection.Type=ESelectionType::Entity;
     Selection.Index=EntityIndex;
     Selection.SubIndex=INDEX_NONE;
@@ -164,16 +168,21 @@ void STacticalLabSurface::SetRuntimeEntities(
 
 void STacticalLabSurface::SetPIEFrame(const FTacticalLabPIEFrame* Frame)
 {
+    FGuid SelectedGuid;
     FName SelectedId=NAME_None;
     if(PIEFrame.IsSet()&&Selection.Type==ESelectionType::Entity&&
         PIEFrame->Agents.IsValidIndex(Selection.Index))
+    {
+        SelectedGuid=PIEFrame->Agents[Selection.Index].AgentId;
         SelectedId=PIEFrame->Agents[Selection.Index].Entity.Id;
+    }
     PIEFrame=Frame?TOptional<FTacticalLabPIEFrame>(*Frame):TOptional<FTacticalLabPIEFrame>();
     if(PIEFrame.IsSet()&&!SelectedId.IsNone())
     {
         const int32 NewIndex=PIEFrame->Agents.IndexOfByPredicate(
-            [SelectedId](const FTacticalLabPIEAgentSnapshot& Agent)
-            {return Agent.Entity.Id==SelectedId;});
+            [SelectedGuid,SelectedId](const FTacticalLabPIEAgentSnapshot& Agent)
+            {return SelectedGuid.IsValid()?Agent.AgentId==SelectedGuid:
+                Agent.Entity.Id==SelectedId;});
         Selection=NewIndex==INDEX_NONE?FSelection{}:
             FSelection{ESelectionType::Entity,NewIndex,INDEX_NONE};
     }
@@ -185,6 +194,49 @@ void STacticalLabSurface::CenterOnWorld(const FVector2D WorldPosition)
     const FVector2f Size(GetCachedGeometry().GetLocalSize());
     SetViewOffset(ToGraph(WorldPosition)-Size/(2.0f*GetZoomAmount()));
     Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+}
+
+void STacticalLabSurface::EnsurePIEPlayersVisible(const FTacticalLabPIEFrame& Frame,
+    const float EdgePadding)
+{
+    const FVector2f PanelSize(GetCachedGeometry().GetLocalSize());
+    if(PanelSize.X<=1.0f||PanelSize.Y<=1.0f||!Frame.bHasPlayers) return;
+
+    FVector2f BoundsMin(BIG_NUMBER,BIG_NUMBER);
+    FVector2f BoundsMax(-BIG_NUMBER,-BIG_NUMBER);
+    int32 PlayerCount=0;
+    for(const FTacticalLabPIEAgentSnapshot& Agent:Frame.Agents)
+    {
+        if(Agent.Entity.Kind!=EHellRunTacticalLabEntityKind::Player) continue;
+        const FVector2f Point=ToPanel(Agent.Entity.Position);
+        BoundsMin.X=FMath::Min(BoundsMin.X,Point.X);
+        BoundsMin.Y=FMath::Min(BoundsMin.Y,Point.Y);
+        BoundsMax.X=FMath::Max(BoundsMax.X,Point.X);
+        BoundsMax.Y=FMath::Max(BoundsMax.Y,Point.Y);
+        ++PlayerCount;
+    }
+    if(PlayerCount==0)
+    {
+        BoundsMin=BoundsMax=ToPanel(Frame.PlayerGroupCenter);
+    }
+
+    const float Padding=FMath::Clamp(EdgePadding,24.0f,
+        FMath::Min(PanelSize.X,PanelSize.Y)*0.35f);
+    const bool bOutsideDeadZone=BoundsMin.X<Padding||BoundsMin.Y<Padding||
+        BoundsMax.X>PanelSize.X-Padding||BoundsMax.Y>PanelSize.Y-Padding;
+    if(!bOutsideDeadZone) return;
+
+    // A follow correction is an intentional camera cut: put the complete player
+    // group at the center instead of leaving the player pinned to an edge.
+    const FVector2f BoundsCenter=(BoundsMin+BoundsMax)*0.5f;
+    const FVector2f PanelShift=PanelSize*0.5f-BoundsCenter;
+
+    if(!PanelShift.IsNearlyZero())
+    {
+        const FVector2f CurrentViewOffset=PanelCoordToGraphCoord(FVector2f::ZeroVector);
+        SetViewOffset(CurrentViewOffset-PanelShift/GetZoomAmount());
+        Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+    }
 }
 
 FVector2D STacticalLabSurface::PanelToWorld(const FGeometry& Geometry,
@@ -1284,7 +1336,8 @@ int32 STacticalLabSurface::OnPaint(const FPaintArgs&,const FGeometry& Geometry,
                 }
                 Outline.Add(ToPanel(Agent.VisionOrigin));
                 FSlateDrawElement::MakeLines(Elements,Layer,Geometry.ToPaintGeometry(),Outline,
-                    ESlateDrawEffect::None,FLinearColor(Base.R,Base.G,Base.B,bSelected?.45f:.14f),true,1.0f);
+                    ESlateDrawEffect::None,FLinearColor(Base.R,Base.G,Base.B,bSelected?.72f:.34f),true,
+                    bSelected?2.5f:1.5f);
             }
             if(Asset->bShowResolvedVisibility&&bSelected)
                 for(const FTacticalLabPIEVisionRay& Ray:Agent.VisionRays)
@@ -1305,10 +1358,18 @@ int32 STacticalLabSurface::OnPaint(const FPaintArgs&,const FGeometry& Geometry,
                                 ESlateDrawEffect::None,FLinearColor(1,.72f,.2f,.9f));
                     }
                 }
-            if(Asset->bShowRoutes&&Agent.MovementPath.Num()>1)
-                DrawSplineRoute(Agent.MovementPath,FLinearColor(.1f,.85f,1.0f,.95f),3.0f,true);
         }
         Layer+=4;
+    }
+    if(PIEFrame.IsSet()&&Asset->bShowRoutes)
+    {
+        for(const FTacticalLabPIEAgentSnapshot& Agent:PIEFrame->Agents)
+            if(Agent.MovementPath.Num()>1)
+                DrawSplineRoute(Agent.MovementPath,
+                    Agent.Entity.Kind==EHellRunTacticalLabEntityKind::Friendly
+                        ?FLinearColor(.16f,.9f,.34f,.95f)
+                        :FLinearColor(.1f,.85f,1.0f,.95f),3.0f,true);
+        Layer+=2;
     }
     if(Asset->bShowRoutes)for(int32 RouteIndex=0;RouteIndex<Scenario.Routes.Num();++RouteIndex)
     {
@@ -1359,6 +1420,40 @@ int32 STacticalLabSurface::OnPaint(const FPaintArgs&,const FGeometry& Geometry,
     Layer+=3;
 
     const bool bOverview=GetZoomAmount()<.55f;
+    auto DrawLiveAgentIcon=[&](const FHellRunTacticalLabEntity& Entity,
+        const FVector2f Center,const bool bSelected,const int32 IconLayer)
+    {
+        const float Radius=bSelected?11.0f:8.5f;
+        const FLinearColor Color=EntityColor(static_cast<uint8>(Entity.Kind));
+        TArray<FVector2f> Outline;
+        if(Entity.Kind==EHellRunTacticalLabEntityKind::Player||
+            Entity.Kind==EHellRunTacticalLabEntityKind::Friendly)
+        {
+            FVector2D WorldForward=Entity.Facing.GetSafeNormal();
+            if(WorldForward.IsNearlyZero()) WorldForward=FVector2D(1,0);
+            const FVector2f Forward(WorldForward),Right(-Forward.Y,Forward.X);
+            const FVector2f Rear=Center-Forward*Radius*.68f;
+            Outline={Center+Forward*Radius,Rear+Right*Radius*.72f,
+                Rear-Right*Radius*.72f,Center+Forward*Radius};
+        }
+        else if(Entity.Kind==EHellRunTacticalLabEntityKind::Enemy)
+        {
+            Outline.Reserve(21);
+            for(int32 Point=0;Point<=20;++Point)
+            {
+                const float Angle=2.0f*PI*Point/20.0f;
+                Outline.Add(Center+FVector2f(FMath::Cos(Angle),FMath::Sin(Angle))*Radius);
+            }
+        }
+        else
+            Outline={Center+FVector2f(0,-Radius),Center+FVector2f(Radius,0),
+                Center+FVector2f(0,Radius),Center+FVector2f(-Radius,0),
+                Center+FVector2f(0,-Radius)};
+        FSlateDrawElement::MakeLines(Elements,IconLayer,Geometry.ToPaintGeometry(),Outline,
+            ESlateDrawEffect::None,Color,true,bSelected?3.5f:2.5f);
+        FSlateDrawElement::MakeBox(Elements,IconLayer,Geometry.ToPaintGeometry(FVector2D(3),
+            FSlateLayoutTransform(Center-FVector2f(1.5f))),White,ESlateDrawEffect::None,Color);
+    };
     int32 CandidateCount=0;
     for(const auto& Entity:Scenario.Entities)
         if(Entity.Kind==EHellRunTacticalLabEntityKind::Candidate)++CandidateCount;
@@ -1395,10 +1490,7 @@ int32 STacticalLabSurface::OnPaint(const FPaintArgs&,const FGeometry& Geometry,
             const FVector2f Center=ToPanel(Entity.Position);
             if(Center.X<-24||Center.Y<-24||Center.X>PanelSize.X+24||Center.Y>PanelSize.Y+24)continue;
             const bool bSelected=Selection.Type==ESelectionType::Entity&&Selection.Index==AgentIndex;
-            const float Size=bSelected?20.0f:16.0f;
-            FSlateDrawElement::MakeBox(Elements,Layer,Geometry.ToPaintGeometry(FVector2D(Size),
-                FSlateLayoutTransform(Center-FVector2f(Size*.5f))),White,ESlateDrawEffect::None,
-                EntityColor(static_cast<uint8>(Entity.Kind)));
+            DrawLiveAgentIcon(Entity,Center,bSelected,Layer);
             if(Asset->bShowLabels)
                 FSlateDrawElement::MakeText(Elements,Layer+1,Geometry.ToPaintGeometry(FVector2D(220,20),
                     FSlateLayoutTransform(Center+FVector2f(11,-9))),Entity.Id.ToString(),
@@ -1581,5 +1673,114 @@ int32 STacticalLabSurface::OnPaint(const FPaintArgs&,const FGeometry& Geometry,
     FSlateDrawElement::MakeText(Elements,Layer+2,Geometry.ToPaintGeometry(FVector2D(70,18),
         FSlateLayoutTransform(FVector2f(16,47))),TEXT("10 m"),
         FCoreStyle::GetDefaultFontStyle(TEXT("Bold"),9),ESlateDrawEffect::None,FLinearColor(.8f,.87f,.9f));
-    return Layer+5;
+
+    // Screen-space legend remains readable regardless of map zoom and pan.
+    const FVector2f LegendOrigin(FMath::Max(12.0f,PanelSize.X-220.0f),12.0f);
+    FSlateDrawElement::MakeBox(Elements,Layer+5,Geometry.ToPaintGeometry(FVector2D(208,126),
+        FSlateLayoutTransform(LegendOrigin)),White,ESlateDrawEffect::None,FLinearColor(.015f,.025f,.04f,.88f));
+    FSlateDrawElement::MakeText(Elements,Layer+6,Geometry.ToPaintGeometry(FVector2D(190,18),
+        FSlateLayoutTransform(LegendOrigin+FVector2f(10,7))),TEXT("LIVE MAP LEGEND"),
+        FCoreStyle::GetDefaultFontStyle(TEXT("Bold"),9),ESlateDrawEffect::None,FLinearColor(.78f,.86f,.92f));
+    struct FLegendEntry { EHellRunTacticalLabEntityKind Kind; const TCHAR* Label; };
+    const FLegendEntry LegendEntries[]={
+        {EHellRunTacticalLabEntityKind::Player,TEXT("Player")},
+        {EHellRunTacticalLabEntityKind::Friendly,TEXT("Friendly bot")},
+        {EHellRunTacticalLabEntityKind::Enemy,TEXT("Enemy")}};
+    for(int32 EntryIndex=0;EntryIndex<UE_ARRAY_COUNT(LegendEntries);++EntryIndex)
+    {
+        const FVector2f Row=LegendOrigin+FVector2f(20,34+EntryIndex*22);
+        FHellRunTacticalLabEntity LegendEntity;
+        LegendEntity.Kind=LegendEntries[EntryIndex].Kind;
+        LegendEntity.Facing=FVector2D(1,0);
+        DrawLiveAgentIcon(LegendEntity,Row,false,Layer+7);
+        FSlateDrawElement::MakeText(Elements,Layer+7,Geometry.ToPaintGeometry(FVector2D(155,18),
+            FSlateLayoutTransform(Row+FVector2f(17,-8))),LegendEntries[EntryIndex].Label,
+            FCoreStyle::GetDefaultFontStyle(TEXT("Regular"),9),ESlateDrawEffect::None,FLinearColor(.82f,.88f,.92f));
+    }
+    TArray<FVector2f> ConeKey={LegendOrigin+FVector2f(12,112),LegendOrigin+FVector2f(28,103),
+        LegendOrigin+FVector2f(28,121),LegendOrigin+FVector2f(12,112)};
+    FSlateDrawElement::MakeLines(Elements,Layer+7,Geometry.ToPaintGeometry(),ConeKey,
+        ESlateDrawEffect::None,FLinearColor(.25f,.72f,1,.8f),true,1.5f);
+    FSlateDrawElement::MakeText(Elements,Layer+7,Geometry.ToPaintGeometry(FVector2D(155,18),
+        FSlateLayoutTransform(LegendOrigin+FVector2f(37,104))),TEXT("Configured view cone"),
+        FCoreStyle::GetDefaultFontStyle(TEXT("Regular"),9),ESlateDrawEffect::None,FLinearColor(.82f,.88f,.92f));
+
+    if(PIEFrame.IsSet())
+    {
+        const FTacticalLabPIEAgentSnapshot* SelectedAgent=
+            Selection.Type==ESelectionType::Entity
+            ?PIEFrame->Agents.FindByPredicate([this](const FTacticalLabPIEAgentSnapshot& Agent)
+                {return PIEFrame->Agents.IsValidIndex(Selection.Index)&&
+                    Agent.AgentId==PIEFrame->Agents[Selection.Index].AgentId;})
+            :nullptr;
+        const FVector2f DebugOrigin(14.0f,FMath::Max(110.0f,PanelSize.Y-142.0f));
+        FSlateDrawElement::MakeBox(Elements,Layer+5,Geometry.ToPaintGeometry(FVector2D(520,128),
+            FSlateLayoutTransform(DebugOrigin)),White,ESlateDrawEffect::None,FLinearColor(.015f,.025f,.04f,.88f));
+        FString DebugText=FString::Printf(TEXT("LIVE  t=%.2fs  |  %d controlled pawns\nSelect an agent for GOAP, navigation, and perception diagnostics."),
+            PIEFrame->WorldTime,PIEFrame->Agents.Num());
+        if(SelectedAgent)
+        {
+            const FString Kind=UEnum::GetValueAsString(SelectedAgent->Entity.Kind);
+            if(SelectedAgent->bHasGOAP)
+            {
+                const FGOAPBrainDebugSnapshot& Debug=SelectedAgent->GOAP;
+                const FString Plan=FString::JoinBy(Debug.RemainingPlan,TEXT(" -> "),
+                    [](const FName Name){return Name.ToString();});
+                DebugText=FString::Printf(TEXT("%s  |  %s  |  team %s\nGoal: %s  |  Action: %s (%s)\nPlan: %s\nLast solve %s  |  cost %.2f  |  %d expanded / %d visited\nSpeed %.0f cm/s  |  path %d pts  |  sight %.0f cm / %.0f deg\nFacts %d  |  goals %d  |  world rev %d  |  replan: %s"),
+                    *SelectedAgent->Entity.Id.ToString(),*Kind,*SelectedAgent->Entity.Team.ToString(),
+                    *Debug.ActiveGoal.ToString(),*Debug.ActiveAction.ToString(),
+                    *UEnum::GetValueAsString(Debug.ActionStatus),Plan.IsEmpty()?TEXT("none"):*Plan,
+                    Debug.LastPlan.bSucceeded?TEXT("success"):TEXT("failure"),Debug.LastPlan.Cost,
+                    Debug.LastPlan.ExpandedNodes,Debug.LastPlan.VisitedStates,
+                    SelectedAgent->Entity.Velocity.Size(),SelectedAgent->MovementPath.Num(),
+                    SelectedAgent->VisionRange,SelectedAgent->VisionHalfAngle,
+                    Debug.Facts.Num(),Debug.GoalScores.Num(),Debug.WorldStateRevision,*Debug.LastReplanReason);
+            }
+            else
+                DebugText=FString::Printf(TEXT("%s  |  %s  |  team %s\nPosition %.0f, %.0f  |  speed %.0f cm/s\nPath %d pts  |  sight %.0f cm / %.0f deg\nNo GOAP brain is attached."),
+                    *SelectedAgent->Entity.Id.ToString(),*Kind,*SelectedAgent->Entity.Team.ToString(),
+                    SelectedAgent->Entity.Position.X,SelectedAgent->Entity.Position.Y,
+                    SelectedAgent->Entity.Velocity.Size(),SelectedAgent->MovementPath.Num(),
+                    SelectedAgent->VisionRange,SelectedAgent->VisionHalfAngle);
+        }
+        FSlateDrawElement::MakeText(Elements,Layer+6,Geometry.ToPaintGeometry(FVector2D(500,112),
+            FSlateLayoutTransform(DebugOrigin+FVector2f(10,8))),DebugText,
+            FCoreStyle::GetDefaultFontStyle(TEXT("Regular"),9),ESlateDrawEffect::None,FLinearColor(.82f,.9f,.94f));
+        if(PIEFrame->bHasDirectorDebug)
+        {
+            const FTacticalLabDirectorDebugSnapshot& Director=PIEFrame->Director;
+            const FVector2f DirectorOrigin(FMath::Max(14.0f,PanelSize.X-534.0f),
+                FMath::Max(150.0f,PanelSize.Y-174.0f));
+            FSlateDrawElement::MakeBox(Elements,Layer+5,
+                Geometry.ToPaintGeometry(FVector2D(520,160),
+                    FSlateLayoutTransform(DirectorOrigin)),White,ESlateDrawEffect::None,
+                FLinearColor(.015f,.025f,.04f,.9f));
+            const FString DirectorText=FString::Printf(
+                TEXT("AI DIRECTOR  |  %s  |  intensity %.2f  enemy %.2f  team %.2f\nCadence: %s / %s  (%.1fs)  %s\nPopulation: %d live, %d engaged, %d survivors, %d spawned  |  cap %.1f\nStates: %d idle  %d investigate  %d chase  %d attack  %d stunned\nTargets: %d players  |  slots %d, max %d/%d  |  in range %d, ready %d\nGates: %d no controller  %d no target  %d missing montage\nRecycle: %d/%d pressure, %d stale, %d pending, %d last/%d total  %s\nPlanner: %d native  |  last batch %d in %.2fms%s"),
+                *Director.Phase,Director.Intensity,Director.EnemyPressure,Director.TeamPressure,
+                *Director.CadenceAction,*Director.CadenceGoal.ToString(),
+                Director.CadenceCommitmentRemaining,*Director.CadenceReason,
+                Director.LiveEnemyCount,Director.EngagedEnemyCount,
+                Director.AliveSurvivorCount,Director.TotalEnemiesSpawned,Director.SpawnCapacity,
+                Director.IdleEnemyCount,Director.InvestigatingEnemyCount,
+                Director.ChasingEnemyCount,Director.AttackingEnemyCount,Director.StunnedEnemyCount,
+                Director.TargetedPlayerCount,Director.ActiveAttackReservationCount,
+                Director.MaxAttackReservationsOnSingleTarget,Director.MaxAttackersPerTarget,
+                Director.TargetInRangeEnemyCount,Director.MeleeReadyEnemyCount,
+                Director.NoControllerEnemyCount,Director.NoTargetEnemyCount,
+                Director.MissingAttackMontageEnemyCount,Director.UsefulPressureEnemyCount,
+                Director.DesiredPressureEnemyCount,Director.StaleTailEnemyCount,
+                Director.PendingRecycleEnemyCount,Director.LastRecycledEnemyCount,
+                Director.TotalRecycledEnemyCount,*Director.RecycleBlockedReason,
+                Director.NativePlannerEnemyCount,Director.LastPlannerBatchAgentCount,
+                Director.LastPlannerBatchMilliseconds,
+                Director.bPlannerBatchActive?TEXT("  ACTIVE"):TEXT(""));
+            FSlateDrawElement::MakeText(Elements,Layer+6,
+                Geometry.ToPaintGeometry(FVector2D(500,144),
+                    FSlateLayoutTransform(DirectorOrigin+FVector2f(10,8))),DirectorText,
+                FCoreStyle::GetDefaultFontStyle(TEXT("Regular"),8),
+                ESlateDrawEffect::None,FLinearColor(.8f,.9f,.94f));
+        }
+    }
+    return Layer+8;
 }

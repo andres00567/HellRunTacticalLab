@@ -16,6 +16,11 @@
     {
       "Name": "HellRunGOAP",
       "Enabled": true
+    },
+    {
+      "Name": "ToolsetRegistry",
+      "Enabled": true,
+      "TargetAllowList": ["Editor"]
     }
   ],
   "Modules": [
@@ -27,7 +32,7 @@
     {
       "Name": "HellRunTacticalLabEditor",
       "Type": "Editor",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "PostEngineInit"
     }
   ]
 }
